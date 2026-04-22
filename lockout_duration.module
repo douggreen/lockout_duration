@@ -1,0 +1,139 @@
+<?php
+/**
+ * @file
+ * Replaces core's 6-hour flood-based login lockout with a configurable
+ * fixed-duration lockout triggered when flood control trips.
+ */
+
+/**
+ * Implements hook_config_info().
+ */
+function lockout_duration_config_info() {
+  return array(
+    'lockout_duration.settings' => array(
+      'label' => t('Lockout Duration settings'),
+      'group' => t('Configuration'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function lockout_duration_menu() {
+  return array(
+    'admin/config/people/lockout-duration' => array(
+      'title' => 'Lockout duration',
+      'description' => 'Configure how long an account stays locked after repeated failed sign-ins.',
+      'page callback' => 'backdrop_get_form',
+      'page arguments' => array('lockout_duration_settings_form'),
+      'access arguments' => array('administer site configuration'),
+      'file' => 'lockout_duration.admin.inc',
+    ),
+  );
+}
+
+/**
+ * Implements hook_user_flood_control().
+ *
+ * Core fires this when its per-user flood window trips. Record the lockout
+ * start so lockout_duration_enforce() can apply the configured window
+ * ahead of core's default 6-hour throttle.
+ */
+function lockout_duration_user_flood_control($ip, $username = NULL) {
+  if (!$username) {
+    return;
+  }
+  $account = _lockout_duration_load_account($username);
+  if ($account && $account->uid) {
+    state_set('lockout_duration_' . $account->uid, REQUEST_TIME);
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for user_login.
+ *
+ * Run the lockout check before core's authenticate_validate so the
+ * configured window overrides core's 6-hour default.
+ */
+function lockout_duration_form_user_login_alter(&$form, &$form_state) {
+  array_unshift($form['#validate'], 'lockout_duration_enforce');
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for user_login_block.
+ *
+ * The login block reuses the same validators; apply the lockout check there
+ * too so users can't bypass it by submitting through the block.
+ */
+function lockout_duration_form_user_login_block_alter(&$form, &$form_state) {
+  array_unshift($form['#validate'], 'lockout_duration_enforce');
+}
+
+/**
+ * Validate callback: enforce the configured lockout window on login.
+ *
+ * @see lockout_duration_form_user_login_alter()
+ * @see lockout_duration_user_flood_control()
+ */
+function lockout_duration_enforce($form, &$form_state) {
+  $name = $form_state['values']['name'] ?? '';
+  if (!$name) {
+    return;
+  }
+  $account = _lockout_duration_load_account($name);
+  if (!$account || !$account->uid) {
+    return;
+  }
+  $lockout_start = state_get('lockout_duration_' . $account->uid, 0);
+  if (!$lockout_start) {
+    return;
+  }
+
+  $duration = (int) config_get('lockout_duration.settings', 'duration');
+  if ($duration < 1) {
+    $duration = 900;
+  }
+  $elapsed = REQUEST_TIME - $lockout_start;
+
+  if ($elapsed < $duration) {
+    $remaining = (int) ceil(($duration - $elapsed) / 60);
+    form_set_error('name', t('This account is temporarily locked due to repeated failed sign-in attempts. Try again in @n minute(s).', array('@n' => max(1, $remaining))));
+    return;
+  }
+
+  // Window expired. Clear our state and core's flood rows for this uid so
+  // the next attempt goes through authenticate_validate cleanly instead of
+  // being blocked by the 6-hour rolling throttle.
+  state_del('lockout_duration_' . $account->uid);
+  $or = db_or()
+    ->condition('identifier', (string) $account->uid)
+    ->condition('identifier', $account->uid . '-%', 'LIKE');
+  db_delete('flood')
+    ->condition('event', 'failed_login_attempt_user')
+    ->condition($or)
+    ->execute();
+}
+
+/**
+ * Resolve a submitted login value (name or email) to a user account.
+ *
+ * Mirrors core's resolution in user_login_authenticate_validate() so a
+ * site configured for email or username-or-email login still enforces
+ * the lockout when the user submits their email.
+ */
+function _lockout_duration_load_account($name) {
+  if (!$name) {
+    return NULL;
+  }
+  $method = config_get('system.core', 'user_login_method');
+  $account = NULL;
+
+  if (($method === USER_LOGIN_USERNAME_OR_EMAIL || $method === USER_LOGIN_EMAIL_ONLY) && valid_email_address($name)) {
+    $account = db_query("SELECT * FROM {users} WHERE mail = :mail", array(':mail' => $name))->fetchObject();
+  }
+  if (!$account && $method !== USER_LOGIN_EMAIL_ONLY) {
+    $account = user_load_by_name($name);
+  }
+  return ($account && !empty($account->uid)) ? $account : NULL;
+}

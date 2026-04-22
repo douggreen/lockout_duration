@@ -1,0 +1,20 @@
+<?php
+/**
+ * @file
+ * Install hooks for the Lockout Duration module.
+ */
+
+/**
+ * Implements hook_uninstall().
+ *
+ * Drop the settings config and any leftover per-user lockout state entries
+ * so the module leaves no orphans behind on uninstall.
+ */
+function lockout_duration_uninstall() {
+  config('lockout_duration.settings')->delete();
+
+  $names = db_query("SELECT name FROM {state} WHERE name LIKE 'lockout_duration\\_%' ESCAPE '\\\\'")->fetchCol();
+  foreach ($names as $name) {
+    state_del($name);
+  }
+}
